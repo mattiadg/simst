@@ -162,3 +162,5 @@ cython_debug/
 .idea/
 
 src/simst/whisper-large-v3-ct2-int
+src/simst/mt_models
+.torch

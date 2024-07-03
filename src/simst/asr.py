@@ -1,17 +1,18 @@
 import argparse
 import asyncio
 import base64
+import logging
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, wait, ALL_COMPLETED
+from concurrent.futures import ProcessPoolExecutor
 from queue import Queue
 
 import numpy as np
 import uvicorn
 from fastapi import FastAPI
+from fastapi.logger import logger
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
-
 
 app = FastAPI()
 
@@ -19,6 +20,9 @@ app = FastAPI()
 model_size = "whisper-large-v3-ct2-int"
 
 AVAILABLE_LANGS = ["en", "de", "it"]
+
+
+logger.setLevel(level=logging.DEBUG)
 
 
 class AudioData(BaseModel):
@@ -57,18 +61,18 @@ executor = ProcessPoolExecutor(max_workers=2)
 
 def transcribe_audio(recv_queue: Queue, send_queue: Queue):
     try:
-        print("Loading model")
+        logger.log(logging.DEBUG, "Loading model")
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        print("model loaded")
+        logger.log(logging.DEBUG, "model loaded")
 
         while audiodata := recv_queue.get():
             recv_queue.task_done()
             sent = False
-            print("received audiodata")
+            logger.log(logging.DEBUG, "received audiodata")
             data = np.frombuffer(base64.b64decode(audiodata.data), dtype=np.float32)
-            print("start transcribe")
+            logger.log(logging.DEBUG, "start transcribe")
             segments, _ = model.transcribe(data, beam_size=5, language=audiodata.language, vad_filter=True)
-            print("transcription complete")
+            logger.log(logging.DEBUG, "transcription complete")
             for segment in segments:
                 send_queue.put(segment)
                 sent = True
@@ -77,7 +81,7 @@ def transcribe_audio(recv_queue: Queue, send_queue: Queue):
         else:
             recv_queue.task_done()
     except EOFError:
-        print("Data stream reached an end")
+        logger.log(logging.DEBUG, "Data stream reached an end")
 
 
 async def queue_get(queue: Queue):
@@ -93,22 +97,21 @@ async def queue_put(queue: Queue, obj):
 
 
 async def run_generator_in_executor(data: AudioData, send_queue: Queue, recv_queue: Queue):
-    print("Sending data")
+    logger.log(logging.DEBUG, "Sending data")
     await queue_put(send_queue, data)
-    print("awaiting for answer")
+    logger.log(logging.DEBUG, "awaiting for answer")
     segment = await queue_get(recv_queue)
     recv_queue.task_done()
-    print(segment)
+    logger.log(logging.DEBUG, segment)
     if segment is None:
-        print(data.start, data.end)
+        logger.log(logging.DEBUG, data.start, data.end)
     return segment
 
 
 @app.websocket("/ws")
-async def upload_file(websocket: WebSocket):
-    print("received a connection")
+async def run_transcription_audio(websocket: WebSocket):
     await manager.connect(websocket)
-    print("received connection")
+    logger.log(logging.DEBUG, "received connection")
     with multiprocessing.Manager() as mmanager:
         send_queue = mmanager.Queue()
         recv_queue = mmanager.Queue()
@@ -133,13 +136,13 @@ async def upload_file(websocket: WebSocket):
         except WebSocketDisconnect:
             manager.disconnect(websocket)
 
-        print("The show must go on")
+        logger.log(logging.DEBUG, "The show must go on")
         send_queue.join()
 
 
 def start_server(args):
     try:
-        uvicorn.run(app, host=args.address, port=args.port)
+        uvicorn.run(app, host=args.address, port=args.port, log_level="debug")
     finally:
         executor.shutdown(cancel_futures=True)
 
