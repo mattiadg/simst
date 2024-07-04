@@ -4,6 +4,7 @@ import base64
 import logging
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
 from queue import Queue
 
 import numpy as np
@@ -14,7 +15,7 @@ from fastapi.websockets import WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
 
-app = FastAPI()
+from src.simst.async_utils import queue_get, queue_put, BiQueue
 
 
 model_size = "whisper-large-v3-ct2-int"
@@ -56,7 +57,51 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-executor = ProcessPoolExecutor(max_workers=2)
+
+class ASRModelsHandler:
+    def __init__(self):
+        self.max_workers = 1
+        self.executor = ProcessPoolExecutor(max_workers=self.max_workers)
+        self.device = "cpu"
+        self.taskgen = parallel_transcription_generator(self.executor)
+        self.queues: list[BiQueue] = []
+
+    async def init(self):
+        await anext(self.taskgen)
+        for _ in range(self.max_workers):
+            self.queues.append(await self.taskgen.asend(1))
+
+    async def transcribe(self, data: AudioData):
+        queues = self.queues[0]
+        logger.log(logging.DEBUG, "Sending data")
+        await queue_put(queues.send, data)
+        logger.log(logging.DEBUG, "awaiting for answer")
+        segment = await queue_get(queues.recv)
+        queues.recv.task_done()
+        logger.log(logging.DEBUG, segment)
+        if segment is None:
+            logger.log(logging.DEBUG, data.start, data.end)
+
+        return segment
+
+    def __del__(self):
+        for queues in self.queues:
+            queues.send.put_nowait(None)
+        self.executor.shutdown(wait=True)
+        self.taskgen.asend(None)
+        return False
+
+
+async def parallel_transcription_generator(executor_: ProcessPoolExecutor):
+    with multiprocessing.Manager() as manager:
+        i = yield
+        loop = asyncio.get_running_loop()
+        while i:
+            send_queue = manager.Queue()
+            recv_queue = manager.Queue()
+            loop.run_in_executor(executor_, transcribe_audio, send_queue, recv_queue)
+            print("task submitted")
+            i = yield BiQueue(send_queue, recv_queue)
 
 
 def transcribe_audio(recv_queue: Queue, send_queue: Queue):
@@ -66,12 +111,12 @@ def transcribe_audio(recv_queue: Queue, send_queue: Queue):
         logger.log(logging.DEBUG, "model loaded")
 
         while audiodata := recv_queue.get():
-            recv_queue.task_done()
             sent = False
             logger.log(logging.DEBUG, "received audiodata")
             data = np.frombuffer(base64.b64decode(audiodata.data), dtype=np.float32)
             logger.log(logging.DEBUG, "start transcribe")
             segments, _ = model.transcribe(data, beam_size=5, language=audiodata.language, vad_filter=True)
+            recv_queue.task_done()
             logger.log(logging.DEBUG, "transcription complete")
             for segment in segments:
                 send_queue.put(segment)
@@ -84,67 +129,49 @@ def transcribe_audio(recv_queue: Queue, send_queue: Queue):
         logger.log(logging.DEBUG, "Data stream reached an end")
 
 
-async def queue_get(queue: Queue):
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, queue.get)
-    return await task
+handler: ASRModelsHandler
 
 
-async def queue_put(queue: Queue, obj):
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, queue.put, obj)
-    await task
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global handler
+    print("init Handler")
+    handler = ASRModelsHandler()
+    await handler.init()
+    print("done")
+    yield
 
 
-async def run_generator_in_executor(data: AudioData, send_queue: Queue, recv_queue: Queue):
-    logger.log(logging.DEBUG, "Sending data")
-    await queue_put(send_queue, data)
-    logger.log(logging.DEBUG, "awaiting for answer")
-    segment = await queue_get(recv_queue)
-    recv_queue.task_done()
-    logger.log(logging.DEBUG, segment)
-    if segment is None:
-        logger.log(logging.DEBUG, data.start, data.end)
-    return segment
+app = FastAPI(lifespan=lifespan)
 
 
 @app.websocket("/ws")
 async def run_transcription_audio(websocket: WebSocket):
     await manager.connect(websocket)
     logger.log(logging.DEBUG, "received connection")
-    with multiprocessing.Manager() as mmanager:
-        send_queue = mmanager.Queue()
-        recv_queue = mmanager.Queue()
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(executor, transcribe_audio, send_queue, recv_queue)
-        try:
-            while True:
-                data = await websocket.receive_json()
-                audiodata = AudioData(**data)
-                if audiodata.language not in AVAILABLE_LANGS:
-                    future.cancel()
-                    await queue_put(send_queue, None)
-                    await websocket.send_text(f"Not available language {audiodata.language}, expected one of {AVAILABLE_LANGS}")
-                    manager.disconnect(websocket)
-                    break
 
-                segment = await run_generator_in_executor(audiodata, send_queue, recv_queue)
-                if not segment:
-                    await websocket.send_json(Segment(start=audiodata.start, end=audiodata.end, text="").dict())
-                else:
-                    await websocket.send_json(Segment(start=audiodata.start, end=audiodata.end, text=segment.text).dict())
-        except WebSocketDisconnect:
-            manager.disconnect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            audiodata = AudioData(**data)
+            if audiodata.language not in AVAILABLE_LANGS:
+                await websocket.send_text(f"Not available language {audiodata.language}, expected one of {AVAILABLE_LANGS}")
+                manager.disconnect(websocket)
+                break
 
-        logger.log(logging.DEBUG, "The show must go on")
-        send_queue.join()
+            segment = await handler.transcribe(audiodata)
+            if not segment:
+                await websocket.send_json(Segment(start=audiodata.start, end=audiodata.end, text="").dict())
+            else:
+                await websocket.send_json(Segment(start=audiodata.start, end=audiodata.end, text=segment.text).dict())
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+    logger.log(logging.DEBUG, "The show must go on")
 
 
 def start_server(args):
-    try:
-        uvicorn.run(app, host=args.address, port=args.port, log_level="debug")
-    finally:
-        executor.shutdown(cancel_futures=True)
+    uvicorn.run(app, host=args.address, port=args.port, log_level="debug")
 
 
 if __name__ == '__main__':
