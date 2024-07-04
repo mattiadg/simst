@@ -5,7 +5,6 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from queue import Queue
-from typing import NamedTuple
 
 import ctranslate2
 import sentencepiece as spm
@@ -13,6 +12,8 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.logger import logger
 from pydantic import BaseModel
+
+from src.simst.async_utils import BiQueue, queue_get, queue_put
 
 AVAILABLE_LANGS = ["en", "de", "it"]
 
@@ -63,11 +64,6 @@ models_paths = {
 
 cuda = "cuda"
 cpu = "cpu"
-
-
-class BiQueue(NamedTuple):
-    send: Queue
-    recv: Queue
 
 
 class MTModelsHandler:
@@ -139,18 +135,6 @@ def translate_task(model_path: dict, device: ctranslate2.Device, recv_queue: Que
     else:
         recv_queue.task_done()
         send_queue.join()
-
-
-async def queue_get(queue: Queue):
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, queue.get)
-    return await task
-
-
-async def queue_put(queue: Queue, obj):
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, queue.put, obj)
-    await task
 
 
 handler: MTModelsHandler
