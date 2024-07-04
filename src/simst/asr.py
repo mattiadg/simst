@@ -55,9 +55,6 @@ class ConnectionManager:
         self.active_connections.remove(websocket)
 
 
-manager = ConnectionManager()
-
-
 class ASRModelsHandler:
     def __init__(self):
         self.max_workers = 1
@@ -100,7 +97,6 @@ async def parallel_transcription_generator(executor_: ProcessPoolExecutor):
             send_queue = manager.Queue()
             recv_queue = manager.Queue()
             loop.run_in_executor(executor_, transcribe_audio, send_queue, recv_queue)
-            print("task submitted")
             i = yield BiQueue(send_queue, recv_queue)
 
 
@@ -130,16 +126,17 @@ def transcribe_audio(recv_queue: Queue, send_queue: Queue):
 
 
 handler: ASRModelsHandler
+manager: ConnectionManager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global handler
-    print("init Handler")
+    global handler, manager
     handler = ASRModelsHandler()
+    manager = ConnectionManager()
     await handler.init()
-    print("done")
     yield
+    manager.disconnect()
 
 
 app = FastAPI(lifespan=lifespan)
