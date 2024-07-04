@@ -1,6 +1,11 @@
 import argparse
+import asyncio
 import logging
-from collections import namedtuple
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
+from queue import Queue
+from typing import NamedTuple
 
 import ctranslate2
 import sentencepiece as spm
@@ -9,15 +14,10 @@ from fastapi import FastAPI
 from fastapi.logger import logger
 from pydantic import BaseModel
 
-app = FastAPI()
-
-
 AVAILABLE_LANGS = ["en", "de", "it"]
 
 
 logger.setLevel(level=logging.DEBUG)
-
-#executor = ProcessPoolExecutor(max_workers=2)
 
 
 class TranslationRequest(BaseModel):
@@ -27,89 +27,6 @@ class TranslationRequest(BaseModel):
     tgtlang: str
     translation: str
 
-
-"""
-def transcribe_audio(recv_queue: Queue, send_queue: Queue):
-    try:
-        print("Loading model")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        print("model loaded")
-
-        while audiodata := recv_queue.get():
-            recv_queue.task_done()
-            sent = False
-            print("received audiodata")
-            data = np.frombuffer(base64.b64decode(audiodata.data), dtype=np.float32)
-            print("start transcribe")
-            segments, _ = model.transcribe(data, beam_size=5, language=audiodata.language, vad_filter=True)
-            print("transcription complete")
-            for segment in segments:
-                send_queue.put(segment)
-                sent = True
-            if not sent:
-                send_queue.put(None)
-        else:
-            recv_queue.task_done()
-    except EOFError:
-        print("Data stream reached an end")
-
-
-async def queue_get(queue: Queue):
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, queue.get)
-    return await task
-
-
-async def queue_put(queue: Queue, obj):
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, queue.put, obj)
-    await task
-
-
-async def run_generator_in_executor(data: AudioData, send_queue: Queue, recv_queue: Queue):
-    print("Sending data")
-    await queue_put(send_queue, data)
-    print("awaiting for answer")
-    segment = await queue_get(recv_queue)
-    recv_queue.task_done()
-    print(segment)
-    if segment is None:
-        print(data.start, data.end)
-    return segment
-
-
-@app.websocket("/ws")
-async def upload_file(websocket: WebSocket):
-    print("received a connection")
-    await manager.connect(websocket)
-    print("received connection")
-    with multiprocessing.Manager() as mmanager:
-        send_queue = mmanager.Queue()
-        recv_queue = mmanager.Queue()
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(executor, transcribe_audio, send_queue, recv_queue)
-        try:
-            while True:
-                data = await websocket.receive_json()
-                audiodata = AudioData(**data)
-                if audiodata.language not in AVAILABLE_LANGS:
-                    future.cancel()
-                    await queue_put(send_queue, None)
-                    await websocket.send_text(f"Not available language {audiodata.language}, expected one of {AVAILABLE_LANGS}")
-                    manager.disconnect(websocket)
-                    break
-
-                segment = await run_generator_in_executor(audiodata, send_queue, recv_queue)
-                if not segment:
-                    await websocket.send_json(Segment(start=audiodata.start, end=audiodata.end, text="").dict())
-                else:
-                    await websocket.send_json(Segment(start=audiodata.start, end=audiodata.end, text=segment.text).dict())
-        except WebSocketDisconnect:
-            manager.disconnect(websocket)
-
-        print("The show must go on")
-        send_queue.join()
-"""
 
 models_paths = {
     "en-it": {
@@ -144,93 +61,163 @@ models_paths = {
     },
 }
 
-Translator = namedtuple("Translator", ["engine", "source_spm", "target_spm"])
+cuda = "cuda"
+cpu = "cpu"
 
-cuda = ctranslate2.Device.cuda
-cpu = ctranslate2.Device.cpu
 
-translators = {}
-for lang in models_paths:
-    ct_model_path = models_paths[lang]["model"]
-    sp_source_model_path = models_paths[lang]["source"]
-    sp_target_model_path = models_paths[lang]["target"]
+class BiQueue(NamedTuple):
+    send: Queue
+    recv: Queue
 
-    device = "cpu"
-    translator = ctranslate2.Translator(ct_model_path, device)
+
+class MTModelsHandler:
+    def __init__(self, device: ctranslate2.Device):
+        self.executor = ProcessPoolExecutor(max_workers=6)
+        self.device = device
+        self.taskgen = parallel_translator_generator(self.executor)
+        self.queues: dict[str, BiQueue] = {}
+
+    async def init(self):
+        await anext(self.taskgen)
+        for lang in models_paths:
+            print(lang)
+            self.queues[lang] = await self.taskgen.asend((models_paths[lang], cpu))
+
+    async def translate(self, source: str, langpair: str, prev: str):
+        queues = self.queues[langpair]
+        await queue_put(queues.send, (source, prev))
+        translation = await queue_get(queues.recv)
+        queues.recv.task_done()
+        return translation
+
+    def __del__(self):
+        for queues in self.queues.values():
+            queues.send.put_nowait(None)
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.taskgen.asend(None)
+        return False
+
+
+async def parallel_translator_generator(executor_: ProcessPoolExecutor):
+    with multiprocessing.Manager() as manager:
+        model_path, device = yield
+        loop = asyncio.get_running_loop()
+        while model_path:
+            send_queue = manager.Queue()
+            recv_queue = manager.Queue()
+            loop.run_in_executor(executor_, translate_task, model_path, device, send_queue, recv_queue)
+            print("task submitted")
+            model_path, device = yield BiQueue(send_queue, recv_queue)
+
+
+def translate_task(model_path: dict, device: ctranslate2.Device, recv_queue: Queue, send_queue: Queue):
+    ct_model_path = model_path["model"]
+    sp_source_model_path = model_path["source"]
+    sp_target_model_path = model_path["target"]
+
+    print("loading model")
+    ct2_translator = ctranslate2.Translator(ct_model_path, device)
+    print("model loaded")
+    print("loading vocabularies")
     sp_source_model = spm.SentencePieceProcessor(sp_source_model_path)
     sp_target_model = spm.SentencePieceProcessor(sp_target_model_path)
-    translators[lang] = Translator(translator, sp_source_model, sp_target_model)
+    print("vocabularies loaded")
+
+    while data := recv_queue.get():
+        source, prev = data
+        print(f"received text: {source}")
+        source_tokenized = sp_source_model.encode(source, out_type=str)
+        translation_objs = ct2_translator.translate_batch([source_tokenized])
+        translations = translation_objs[0].hypotheses
+        translations_detokenized = sp_target_model.decode(translations)
+        translation = " ".join(translations_detokenized)
+        print(f"produced translation: {translation}")
+
+        recv_queue.task_done()
+        send_queue.put(translation)
+
+    else:
+        recv_queue.task_done()
+        send_queue.join()
 
 
-def translate(
-    source: str,
-    translator: ctranslate2.Translator,
-    sp_source_model: spm.SentencePieceProcessor,
-    sp_target_model: spm.SentencePieceProcessor,
-):
-    """
-    Use CTranslate model to translate a sentence
+async def queue_get(queue: Queue):
+    loop = asyncio.get_running_loop()
+    task = loop.run_in_executor(None, queue.get)
+    return await task
 
-    Args:
-        source: Source sentences to translate
-        translator: Object of Translator, with the CTranslate2 model
-        sp_source_model: Object of SentencePieceProcessor, with the SentencePiece source model
-        sp_target_model: Object of SentencePieceProcessor, with the SentencePiece target model
-    Returns:
-        Translation of the source text
-    """
-    
-    print(f"received text: {source}")
-    source_sentences = source
-    source_tokenized = sp_source_model.encode(source_sentences, out_type=str)
-    print(source_tokenized)
-    translation_objs = translator.translate_batch([source_tokenized])
-    print(translation_objs)
-    translations = translation_objs[0].hypotheses
-    translations_detokenized = sp_target_model.decode(translations)
-    translation = " ".join(translations_detokenized)
-    print(f"produced translation: {translation}")
 
-    return translation
+async def queue_put(queue: Queue, obj):
+    loop = asyncio.get_running_loop()
+    task = loop.run_in_executor(None, queue.put, obj)
+    await task
+
+
+handler: MTModelsHandler
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global handler
+    print("init Handler")
+    handler = MTModelsHandler(device=cpu)
+    await handler.init()
+    print("done")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/translate")
-def translate_service(request: TranslationRequest):
-    print("processing translation request")
-    # Get the JSON data from the request
+async def translate_service(request: TranslationRequest):
     print(f"received data: {request}")
 
-    print(request)
     text = request.src_sent
     source_lang = request.srclang
     target_lang = request.tgtlang
+    prev = request.prev_trans
 
     lang_pair = (
         f"{source_lang.split('-')[0].lower()}-{target_lang.split('-')[0].lower()}"
     )
-    translator = translators[lang_pair]
-    print(translator)
-    translated = translate(text, *translator)
+    translated = await handler.translate(text, lang_pair, prev)
     request.translation = translated
 
-    # Return the processed JSON data
-    return request.model_dump(mode="python")
+    return request.json()
 
 
 def start_server(args):
-    #try:
-        uvicorn.run(app, host=args.address, port=args.port, log_level="debug")
-    #finally:
-        #executor.shutdown(cancel_futures=True)
+    uvicorn.run(app, host=args.address, port=args.port, log_level="debug")
+
+
+def send_request(args):
+    import requests
+    address = f"http://{args.address}:{args.port}/translate"
+    payload = TranslationRequest(
+        src_sent=args.text, prev_trans="", srclang=args.srclang, tgtlang=args.tgtlang, translation=""
+    )
+    print(payload.json())
+    response = requests.post(address, data=payload.json())
+    print(response, response.json())
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers()
+
     server_parser = subparsers.add_parser("server")
     server_parser.add_argument("--address", type=str, default="127.0.0.1", help="ip address")
     server_parser.add_argument("--port", type=int, default=8001, help="ip port")
     server_parser.set_defaults(func=start_server)
+
+    client_parser = subparsers.add_parser("client")
+    client_parser.add_argument("--address", type=str, default="127.0.0.1", help="ip address")
+    client_parser.add_argument("--port", type=int, default=8001, help="ip port")
+    client_parser.add_argument("--text", default="ciao")
+    client_parser.add_argument("--srclang", "-s", default="it")
+    client_parser.add_argument("--tgtlang", "-t", default="de")
+    client_parser.set_defaults(func=send_request)
 
     args = parser.parse_args()
     args.func(args)
