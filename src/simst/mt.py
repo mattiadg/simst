@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
@@ -7,13 +8,14 @@ from contextlib import asynccontextmanager
 from queue import Queue
 
 import ctranslate2
+import httpx
 import sentencepiece as spm
 import uvicorn
 from fastapi import FastAPI
 from fastapi.logger import logger
 from pydantic import BaseModel
 
-from src.simst.async_utils import BiQueue, queue_get, queue_put
+from src.simst.async_utils import BiQueue, queue_get, queue_put, health
 
 AVAILABLE_LANGS = ["en", "de", "it"]
 
@@ -26,7 +28,39 @@ class TranslationRequest(BaseModel):
     prev_trans: str
     srclang: str
     tgtlang: str
+
+
+class TranslationResponse(BaseModel):
+    src_sent: str
+    prev_trans: str
+    srclang: str
+    tgtlang: str
     translation: str
+
+
+class MT:
+    def __init__(self, srclang: str, tgtlang: str, port: int, timeout: int = 5):
+        self.srclang = srclang
+        self.tgtlang = tgtlang
+        self.port = port
+        self.timeout = timeout
+
+        self.server = f"http://localhost:{port}"
+
+        health = httpx.get(self.server + "/health", timeout=timeout)
+        if health.status_code != httpx.codes.OK:
+            raise RuntimeError(f"Impossible to contact server at http://localhost:{port}")
+
+    async def translate(self, source: str, prev_target: str) -> TranslationResponse:
+        payload = TranslationRequest(
+            src_sent=source,
+            prev_trans=prev_target,
+            srclang=self.srclang,
+            tgtlang=self.tgtlang,
+        )
+        async with httpx.AsyncClient() as client:
+            response = await client.post(self.server + "/translate", timeout=self.timeout, data=payload.json())
+        return TranslationResponse(**response.json())
 
 
 models_paths = {
@@ -153,7 +187,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-@app.post("/translate")
+@app.post("/translate", response_model=TranslationResponse)
 async def translate_service(request: TranslationRequest):
     print(f"received data: {request}")
 
@@ -166,9 +200,11 @@ async def translate_service(request: TranslationRequest):
         f"{source_lang.split('-')[0].lower()}-{target_lang.split('-')[0].lower()}"
     )
     translated = await handler.translate(text, lang_pair, prev)
-    request.translation = translated
 
-    return request.json()
+    return {"translation": translated, **request.model_dump()}
+
+
+app.get("/health")(health)
 
 
 def start_server(args):
@@ -176,14 +212,18 @@ def start_server(args):
 
 
 def send_request(args):
-    import requests
     address = f"http://{args.address}:{args.port}/translate"
     payload = TranslationRequest(
-        src_sent=args.text, prev_trans="", srclang=args.srclang, tgtlang=args.tgtlang, translation=""
+        src_sent=args.text, prev_trans="", srclang=args.srclang, tgtlang=args.tgtlang
     )
     print(payload.json())
-    response = requests.post(address, data=payload.json())
+    response = httpx.post(address, data=payload.json())
     print(response, response.json())
+
+
+def start_mt(args):
+    mt = MT(args.srclang, args.tgtlang, args.port)
+    print(asyncio.run(mt.translate(source="non voglio andare a scuola", prev_target="")))
 
 
 if __name__ == '__main__':
@@ -202,6 +242,12 @@ if __name__ == '__main__':
     client_parser.add_argument("--srclang", "-s", default="it")
     client_parser.add_argument("--tgtlang", "-t", default="de")
     client_parser.set_defaults(func=send_request)
+
+    check_parser = subparsers.add_parser("check")
+    check_parser.add_argument("--srclang", "-s", default="it")
+    check_parser.add_argument("--tgtlang", "-t", default="de")
+    check_parser.add_argument("--port", type=int, default=8001, help="ip port")
+    check_parser.set_defaults(func=start_mt)
 
     args = parser.parse_args()
     args.func(args)

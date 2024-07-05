@@ -1,22 +1,25 @@
 import argparse
 import asyncio
 import base64
+import json
 import logging
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from queue import Queue
+from typing import AsyncIterator, AsyncGenerator
 
 import numpy as np
 import uvicorn
+import websockets
 from fastapi import FastAPI
 from fastapi.logger import logger
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
+import httpx
 from pydantic import BaseModel
 
-from src.simst.async_utils import queue_get, queue_put, BiQueue
-
+from src.simst.async_utils import queue_get, queue_put, BiQueue, health
 
 model_size = "whisper-large-v3-ct2-int"
 
@@ -34,6 +37,7 @@ class AudioData(BaseModel):
     data: str
     start: float
     end: float
+    prefix: str
 
 
 class Segment(BaseModel):
@@ -53,6 +57,54 @@ class ConnectionManager:
 
     def disconnect(self, websocket: WebSocket):
         self.active_connections.remove(websocket)
+
+    def disconnect_all(self):
+        self.active_connections.clear()
+
+
+class ASR:
+    def __init__(self, lang: str, port: int, timeout: int = 5):
+        self.lang = lang
+        self.port = port
+        self.timeout = timeout
+
+        self.server = f"localhost:{port}"
+
+        health = httpx.get(f"http://{self.server}/health", timeout=timeout)
+        if health.status_code != httpx.codes.ok:
+            raise RuntimeError(f"Impossible to contact server at http://localhost:{port}")
+
+    async def transcribe(self, data: AsyncIterator[np.ndarray]) -> AsyncGenerator:
+        json_data = {
+            "format": "wav",
+            "samplerate": 16000,
+            "channels": 1,
+            "language": "en",
+        }
+        prefix = ""
+        sr = json_data["samplerate"]
+        async with websockets.connect(f"ws://{self.server}/ws") as websocket:
+            i = -1
+            async for audio_data in data:
+                i += 1
+                json_data["data"] = base64.b64encode(audio_data.tobytes()).decode('utf-8')
+                json_data["start"] = i * len(audio_data) / sr
+                json_data["end"] = (i + 1) * len(audio_data) / sr
+                json_data["prefix"] = prefix
+                # Send a POST request with JSON data
+                await websocket.send(AudioData(**json_data).json())
+                response = await websocket.recv()
+                try:
+                    response_dict = json.loads(response)
+                    segment = Segment(**response_dict)
+                except json.decoder.JSONDecodeError as e:
+                    print(f"Response: {response}")
+                    exit()
+                except Exception as e:
+                    print(response)
+                    raise e
+                else:
+                    prefix = yield segment
 
 
 class ASRModelsHandler:
@@ -103,15 +155,16 @@ async def parallel_transcription_generator(executor_: ProcessPoolExecutor):
 def transcribe_audio(recv_queue: Queue, send_queue: Queue):
     try:
         logger.log(logging.DEBUG, "Loading model")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=8)
         logger.log(logging.DEBUG, "model loaded")
 
         while audiodata := recv_queue.get():
             sent = False
             logger.log(logging.DEBUG, "received audiodata")
             data = np.frombuffer(base64.b64decode(audiodata.data), dtype=np.float32)
+            prefix = audiodata.prefix
             logger.log(logging.DEBUG, "start transcribe")
-            segments, _ = model.transcribe(data, beam_size=5, language=audiodata.language, vad_filter=True)
+            segments, _ = model.transcribe(data, beam_size=5, language=audiodata.language, vad_filter=True, initial_prompt=prefix)
             recv_queue.task_done()
             logger.log(logging.DEBUG, "transcription complete")
             for segment in segments:
@@ -136,7 +189,7 @@ async def lifespan(app: FastAPI):
     manager = ConnectionManager()
     await handler.init()
     yield
-    manager.disconnect()
+    manager.disconnect_all()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -167,8 +220,15 @@ async def run_transcription_audio(websocket: WebSocket):
     logger.log(logging.DEBUG, "The show must go on")
 
 
+app.get("/health")(health)
+
+
 def start_server(args):
     uvicorn.run(app, host=args.address, port=args.port, log_level="debug")
+
+
+def start_asr(args):
+    ASR(args.lang, args.port)
 
 
 if __name__ == '__main__':
@@ -178,6 +238,11 @@ if __name__ == '__main__':
     server_parser.add_argument("--address", type=str, default="127.0.0.1", help="ip address")
     server_parser.add_argument("--port", type=int, default=8000, help="ip port")
     server_parser.set_defaults(func=start_server)
+
+    check_parser = subparsers.add_parser("check")
+    check_parser.add_argument("--lang", "-t", default="de")
+    check_parser.add_argument("--port", type=int, default=8000, help="ip port")
+    check_parser.set_defaults(func=start_asr)
 
     args = parser.parse_args()
     args.func(args)

@@ -18,3 +18,7 @@ async def queue_put(queue: Queue, obj):
     loop = asyncio.get_running_loop()
     task = loop.run_in_executor(None, queue.put, obj)
     await task
+
+
+def health():
+    return {"up": True}
