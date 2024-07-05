@@ -60,18 +60,18 @@ async def simultaneous_st(audio: pathlib.Path, config: STConfig) -> Iterator[tup
         to_trans = transcript.text
         if to_trans.endswith("."):
             to_trans = to_trans.rstrip(".")
+        buffer = to_trans
         try:
             sentence_end = to_trans.index(".")
             if sentence_end > -1:
                 trans1 = to_trans[:sentence_end+1]
+                print("truncated = " + trans1)
                 translation1 = await mt.translate(trans1, "")
                 yield trans1, translation1.translation
                 to_trans = to_trans[sentence_end+1:]
+                buffer = to_trans
         except ValueError:
-            pass
-        buffer = to_trans
-        if to_trans:
-            translation = await mt.translate(to_trans, buffer)
+            translation = await mt.translate(to_trans, "")
             yield to_trans, translation.translation
 
 

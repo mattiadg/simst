@@ -156,7 +156,7 @@ async def parallel_transcription_generator(executor_: ProcessPoolExecutor):
 def transcribe_audio(recv_queue: Queue, send_queue: Queue):
     try:
         logger.log(logging.DEBUG, "Loading model")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=8)
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
         punc_model = PunctuationModel(model="kredor/punctuate-all")
         logger.log(logging.DEBUG, "model loaded")
 
@@ -169,10 +169,13 @@ def transcribe_audio(recv_queue: Queue, send_queue: Queue):
             segments, _ = model.transcribe(data, beam_size=5, language=audiodata.language, vad_filter=True, initial_prompt=prefix)
             recv_queue.task_done()
             logger.log(logging.DEBUG, "transcription complete")
+            text = prefix
             for segment in segments:
+                text += " " + segment.text
+            if text != prefix:
                 segdict = segment._asdict()
                 del segdict["text"]
-                segment_ = Segment(**segdict, text=punc_model.restore_punctuation(prefix + " " + segment.text))
+                segment_ = Segment(**segdict, text=punc_model.restore_punctuation(text))
                 send_queue.put(segment_)
                 sent = True
             if not sent:
