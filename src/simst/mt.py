@@ -1,12 +1,12 @@
 import argparse
 import asyncio
-import json
 import logging
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from queue import Queue
 
+import torch  #  prevent libiomp5.dll error
 import ctranslate2
 import httpx
 import sentencepiece as spm

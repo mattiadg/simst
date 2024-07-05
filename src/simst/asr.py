@@ -12,6 +12,7 @@ from typing import AsyncIterator, AsyncGenerator
 import numpy as np
 import uvicorn
 import websockets
+from deepmultilingualpunctuation import PunctuationModel
 from fastapi import FastAPI
 from fastapi.logger import logger
 from fastapi.websockets import WebSocket, WebSocketDisconnect
@@ -111,7 +112,7 @@ class ASRModelsHandler:
     def __init__(self):
         self.max_workers = 1
         self.executor = ProcessPoolExecutor(max_workers=self.max_workers)
-        self.device = "cpu"
+        self.device = "cuda"
         self.taskgen = parallel_transcription_generator(self.executor)
         self.queues: list[BiQueue] = []
 
@@ -156,6 +157,7 @@ def transcribe_audio(recv_queue: Queue, send_queue: Queue):
     try:
         logger.log(logging.DEBUG, "Loading model")
         model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=8)
+        punc_model = PunctuationModel(model="kredor/punctuate-all")
         logger.log(logging.DEBUG, "model loaded")
 
         while audiodata := recv_queue.get():
@@ -168,7 +170,10 @@ def transcribe_audio(recv_queue: Queue, send_queue: Queue):
             recv_queue.task_done()
             logger.log(logging.DEBUG, "transcription complete")
             for segment in segments:
-                send_queue.put(segment)
+                segdict = segment._asdict()
+                del segdict["text"]
+                segment_ = Segment(**segdict, text=punc_model.restore_punctuation(prefix + " " + segment.text))
+                send_queue.put(segment_)
                 sent = True
             if not sent:
                 send_queue.put(None)

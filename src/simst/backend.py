@@ -39,9 +39,9 @@ class AudioStreamer:
         """
         i = 0
         batchlen = int(delay * self.audio.sr / 1000)
-        await asyncio.sleep(delay / 1000)
+        #await asyncio.sleep(delay / 1000)
         while i < len(self.audio.data):  # this may need to change when receiving actual streams
-            await asyncio.sleep(step / 1000)
+            await asyncio.sleep(1)
             nexti = i + batchlen
             yield self.audio.data[i:nexti]
             i = i + int(step * self.audio.sr / 1000)
@@ -56,9 +56,10 @@ async def simultaneous_st(audio: pathlib.Path, config: STConfig) -> Iterator[tup
     transcriber = asr.transcribe(streamer.stream(config.initial_delay, config.step))
     while True:
         transcript = await transcriber.asend(buffer)
-        if not buffer:
-            buffer = ""
-        to_trans = buffer + transcript.text
+
+        to_trans = transcript.text
+        if to_trans.endswith("."):
+            to_trans = to_trans.rstrip(".")
         try:
             sentence_end = to_trans.index(".")
             if sentence_end > -1:
