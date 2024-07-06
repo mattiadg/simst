@@ -1,5 +1,7 @@
 import asyncio
+import multiprocessing
 import pathlib
+import queue
 import sys
 from dataclasses import dataclass
 from typing import Iterator
@@ -8,6 +10,7 @@ import numpy as np
 from faster_whisper import decode_audio
 
 from src.simst.asr import ASR
+from src.simst.async_utils import queue_put, queue_get
 from src.simst.mt import MT
 
 
@@ -28,10 +31,11 @@ class STConfig:
 
 
 class AudioStreamer:
-    def __init__(self, audiofile: pathlib.Path):
+    def __init__(self, audiofile: pathlib.Path, out_queue: queue.Queue):
         self.audio = Audio(decode_audio(audiofile), 16000)
+        self.out_queue = out_queue
 
-    async def stream(self, delay: int, step: int) -> Iterator[np.ndarray]:
+    async def stream(self, delay: int, step: int):
         """
         Stream the wrapped audio in batches of `delay` ms
         :param delay: length of the audio stream at each batch
@@ -39,40 +43,32 @@ class AudioStreamer:
         """
         i = 0
         batchlen = int(delay * self.audio.sr / 1000)
-        #await asyncio.sleep(delay / 1000)
+        await asyncio.sleep(delay / 1000)
         while i < len(self.audio.data):  # this may need to change when receiving actual streams
-            await asyncio.sleep(1)
+            print("STREAM: sending data")
             nexti = i + batchlen
-            yield self.audio.data[i:nexti]
+            await queue_put(self.out_queue, self.audio.data[i:nexti])
+            await asyncio.sleep(step / 1000)
             i = i + int(step * self.audio.sr / 1000)
+
+        queue_put(self.out_queue, None)
 
 
 async def simultaneous_st(audio: pathlib.Path, config: STConfig) -> Iterator[tuple[str, str]]:
-    streamer = AudioStreamer(audio)
-    asr = ASR(config.srclang, config.asr_port)
-    mt = MT(config.srclang, config.tgtlang, config.mt_port)
+    with multiprocessing.Manager() as manager:
+        stream_queue = manager.Queue()
+        asr_queue = manager.Queue()
+        mt_queue = manager.Queue()
+        streamer = AudioStreamer(audio, stream_queue)
+        asr = ASR(config.srclang, config.asr_port, stream_queue, asr_queue)
+        mt = MT(config.srclang, config.tgtlang, config.mt_port, asr_queue, mt_queue)
 
-    buffer = None
-    transcriber = asr.transcribe(streamer.stream(config.initial_delay, config.step))
-    while True:
-        transcript = await transcriber.asend(buffer)
+        task_stream = asyncio.create_task(streamer.stream(config.initial_delay, config.step))
+        task_asr = asyncio.create_task(asr.transcribe())
+        task_mt = asyncio.create_task(mt.translate())
 
-        to_trans = transcript.text
-        if to_trans.endswith("."):
-            to_trans = to_trans.rstrip(".")
-        buffer = to_trans
-        try:
-            sentence_end = to_trans.index(".")
-            if sentence_end > -1:
-                trans1 = to_trans[:sentence_end+1]
-                print("truncated = " + trans1)
-                translation1 = await mt.translate(trans1, "")
-                yield trans1, translation1.translation
-                to_trans = to_trans[sentence_end+1:]
-                buffer = to_trans
-        except ValueError:
-            translation = await mt.translate(to_trans, "")
-            yield to_trans, translation.translation
+        while (data := await queue_get(mt_queue)) is not None:
+            yield data
 
 
 async def main():

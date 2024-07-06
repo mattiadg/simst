@@ -39,11 +39,13 @@ class TranslationResponse(BaseModel):
 
 
 class MT:
-    def __init__(self, srclang: str, tgtlang: str, port: int, timeout: int = 5):
+    def __init__(self, srclang: str, tgtlang: str, port: int, in_queue: Queue, out_queue: Queue, timeout: int = 5):
         self.srclang = srclang
         self.tgtlang = tgtlang
         self.port = port
         self.timeout = timeout
+        self.in_queue = in_queue
+        self.out_queue = out_queue
 
         self.server = f"http://localhost:{port}"
 
@@ -51,16 +53,20 @@ class MT:
         if health.status_code != httpx.codes.OK:
             raise RuntimeError(f"Impossible to contact server at http://localhost:{port}")
 
-    async def translate(self, source: str, prev_target: str) -> TranslationResponse:
+    async def translate(self):
         payload = TranslationRequest(
-            src_sent=source,
-            prev_trans=prev_target,
+            src_sent="",
+            prev_trans="",
             srclang=self.srclang,
             tgtlang=self.tgtlang,
         )
-        async with httpx.AsyncClient() as client:
-            response = await client.post(self.server + "/translate", timeout=self.timeout, data=payload.json())
-        return TranslationResponse(**response.json())
+        while (source := await queue_get(self.in_queue)) is not None:
+            payload.src_sent = source
+            async with httpx.AsyncClient() as client:
+                response = await client.post(self.server + "/translate", timeout=self.timeout, data=payload.json())
+            await queue_put(self.out_queue, (source, TranslationResponse(**response.json())))
+
+        queue_put(self.out_queue, None)
 
 
 models_paths = {

@@ -64,10 +64,12 @@ class ConnectionManager:
 
 
 class ASR:
-    def __init__(self, lang: str, port: int, timeout: int = 5):
+    def __init__(self, lang: str, port: int, in_queue: Queue, out_queue: Queue, timeout: int = 5, ):
         self.lang = lang
         self.port = port
         self.timeout = timeout
+        self.in_queue = in_queue
+        self.out_queue = out_queue
 
         self.server = f"localhost:{port}"
 
@@ -75,7 +77,8 @@ class ASR:
         if health.status_code != httpx.codes.ok:
             raise RuntimeError(f"Impossible to contact server at http://localhost:{port}")
 
-    async def transcribe(self, data: AsyncIterator[np.ndarray]) -> AsyncGenerator:
+    async def transcribe(self):
+        print("ASR: start transcribe")
         json_data = {
             "format": "wav",
             "samplerate": 16000,
@@ -86,7 +89,7 @@ class ASR:
         sr = json_data["samplerate"]
         async with websockets.connect(f"ws://{self.server}/ws") as websocket:
             i = -1
-            async for audio_data in data:
+            while (audio_data := await queue_get(self.in_queue)) is not None:
                 i += 1
                 json_data["data"] = base64.b64encode(audio_data.tobytes()).decode('utf-8')
                 json_data["start"] = i * len(audio_data) / sr
@@ -104,8 +107,21 @@ class ASR:
                 except Exception as e:
                     print(response)
                     raise e
-                else:
-                    prefix = yield segment
+                to_trans = segment.text
+                if to_trans.endswith("."):
+                    to_trans = to_trans.rstrip(".")
+                prefix = to_trans
+                try:
+                    sentence_end = to_trans.index(".")
+                    if sentence_end > -1:
+                        trans1 = to_trans[:sentence_end + 1]
+                        await queue_put(self.out_queue, trans1)
+                        to_trans = to_trans[sentence_end + 1:]
+                        prefix = to_trans
+                except ValueError:
+                    await queue_put(self.out_queue, to_trans)
+
+        queue_put(self.out_queue, None)
 
 
 class ASRModelsHandler:
