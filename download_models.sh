@@ -17,3 +17,5 @@ for dir in enit ende iten deen itde deit; do
   cp opus/target.spm $dir/
 done
 popd
+
+ct2-transformers-converter --model SYSTRAN/faster-whisper-medium --output_dir src/simst/whisper-medium-ct2-int8 --quantization int8
