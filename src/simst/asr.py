@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from src.simst.async_utils import queue_get, queue_put, BiQueue, health
 
-model_size = "whisper-medium-ct2-int"
+model_size = "whisper-medium-ct2-int8"
 
 AVAILABLE_LANGS = ["en", "de", "it"]
 
