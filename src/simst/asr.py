@@ -4,11 +4,13 @@ import base64
 import json
 import logging
 import multiprocessing
+import queue
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from queue import Queue
-from typing import AsyncIterator, AsyncGenerator
 
+import httpx
 import numpy as np
 import uvicorn
 import websockets
@@ -17,12 +19,11 @@ from fastapi import FastAPI
 from fastapi.logger import logger
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
-import httpx
 from pydantic import BaseModel
 
 from src.simst.async_utils import queue_get, queue_put, BiQueue, health
 
-model_size = "whisper-large-v3-ct2-int"
+model_size = "whisper-medium-ct2-int"
 
 AVAILABLE_LANGS = ["en", "de", "it"]
 
@@ -47,6 +48,12 @@ class Segment(BaseModel):
     text: str
 
 
+@dataclass
+class ReturnTranscript:
+    text: str
+    complete: bool
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -64,12 +71,13 @@ class ConnectionManager:
 
 
 class ASR:
-    def __init__(self, lang: str, port: int, in_queue: Queue, out_queue: Queue, timeout: int = 5, ):
+    def __init__(self, lang: str, port: int, in_queue: Queue, out_queue: Queue, close_queue: queue.Queue, timeout: int = 5, ):
         self.lang = lang
         self.port = port
         self.timeout = timeout
         self.in_queue = in_queue
         self.out_queue = out_queue
+        self.close_queue = close_queue
 
         self.server = f"localhost:{port}"
 
@@ -90,6 +98,21 @@ class ASR:
         async with websockets.connect(f"ws://{self.server}/ws") as websocket:
             i = -1
             while (audio_data := await queue_get(self.in_queue)) is not None:
+                try:
+                    if self.close_queue.get(block=False) is None:
+                        await queue_put(self.out_queue, None)
+                        print("ASR: closing for close_queue")
+                        self.close_queue.task_done()
+                        break
+                except queue.Empty:
+                    pass
+                try:
+                    while (additional := await asyncio.to_thread(self.in_queue.get, block=False)) is not None:
+                        audio_data = np.concatenate([audio_data, additional])
+                    else:
+                        await queue_put(self.in_queue, None)
+                except queue.Empty:
+                    pass
                 i += 1
                 json_data["data"] = base64.b64encode(audio_data.tobytes()).decode('utf-8')
                 json_data["start"] = i * len(audio_data) / sr
@@ -115,13 +138,15 @@ class ASR:
                     sentence_end = to_trans.index(".")
                     if sentence_end > -1:
                         trans1 = to_trans[:sentence_end + 1]
-                        await queue_put(self.out_queue, trans1)
+                        await queue_put(self.out_queue, ReturnTranscript(trans1, complete=True))
                         to_trans = to_trans[sentence_end + 1:]
                         prefix = to_trans
                 except ValueError:
-                    await queue_put(self.out_queue, to_trans)
-
-        queue_put(self.out_queue, None)
+                    await queue_put(self.out_queue, ReturnTranscript(to_trans, complete=False))
+            else:
+                await queue_put(self.out_queue, None)
+                await queue_get(self.close_queue)
+                self.close_queue.task_done()
 
 
 class ASRModelsHandler:

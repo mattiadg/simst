@@ -8,15 +8,13 @@ class BiQueue(NamedTuple):
     recv: Queue
 
 
-async def queue_get(queue: Queue):
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, queue.get)
+async def queue_get(queue: Queue, blocking=True, timeout=None):
+    task = asyncio.to_thread(queue.get, block=blocking, timeout=timeout)
     return await task
 
 
 async def queue_put(queue: Queue, obj):
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, queue.put, obj)
+    task = asyncio.to_thread(queue.put, obj)
     await task
 
 

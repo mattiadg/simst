@@ -2,11 +2,13 @@ import argparse
 import asyncio
 import logging
 import multiprocessing
+import queue
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from queue import Queue
+from typing import NamedTuple
 
-import torch  #  prevent libiomp5.dll error
+import torch  # necessary for preventing libiomp5.dll error
 import ctranslate2
 import httpx
 import sentencepiece as spm
@@ -38,14 +40,21 @@ class TranslationResponse(BaseModel):
     translation: str
 
 
+class ReturnText(NamedTuple):
+    transcript: str
+    translation: str
+    complete: bool
+
+
 class MT:
-    def __init__(self, srclang: str, tgtlang: str, port: int, in_queue: Queue, out_queue: Queue, timeout: int = 5):
+    def __init__(self, srclang: str, tgtlang: str, port: int, in_queue: Queue, out_queue: Queue, close_queue: queue.Queue, timeout: int = 5):
         self.srclang = srclang
         self.tgtlang = tgtlang
         self.port = port
         self.timeout = timeout
         self.in_queue = in_queue
         self.out_queue = out_queue
+        self.close_queue = close_queue
 
         self.server = f"http://localhost:{port}"
 
@@ -61,12 +70,21 @@ class MT:
             tgtlang=self.tgtlang,
         )
         while (source := await queue_get(self.in_queue)) is not None:
-            payload.src_sent = source
+            try:
+                if self.close_queue.get(block=False) is None:
+                    await queue_put(self.out_queue, None)
+                    self.close_queue.task_done()
+                    break
+            except queue.Empty:
+                pass
+            payload.src_sent = source.text
             async with httpx.AsyncClient() as client:
                 response = await client.post(self.server + "/translate", timeout=self.timeout, data=payload.json())
-            await queue_put(self.out_queue, (source, TranslationResponse(**response.json())))
-
-        queue_put(self.out_queue, None)
+            await queue_put(self.out_queue, ReturnText(source.text, response.json()["translation"], complete=source.complete))
+        else:
+            await queue_put(self.out_queue, None)
+            await queue_get(self.close_queue)
+            self.close_queue.task_done()
 
 
 models_paths = {
